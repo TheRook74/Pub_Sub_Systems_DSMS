@@ -1,0 +1,8 @@
+{
+    "server_id": "server1",
+    "apps": [
+        "python",
+        "chrome",
+        "code"
+    ]
+}
