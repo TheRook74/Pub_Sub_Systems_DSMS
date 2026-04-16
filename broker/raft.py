@@ -328,6 +328,24 @@ class RaftNode:
                         self.current_term, self.node_id, len(self.raft_log) - 1, False))
                     return
 
+            # --- Truncate stale tail ---
+            # Raft paper rule: follower must delete any entries beyond
+            # prev_log_index that the new leader did not send.  This covers
+            # the empty-heartbeat case where entries=[] but the follower still
+            # has uncommitted entries from a previous leader that must be removed.
+            if entries:
+                first_new_idx = entries[0]["index"]
+                if first_new_idx < len(self.raft_log):
+                    # Only truncate if there is actually a conflict at that point
+                    if self.raft_log[first_new_idx]["term"] != entries[0]["term"]:
+                        self.raft_log = self.raft_log[:first_new_idx]
+            else:
+                # Empty heartbeat: remove anything beyond prev_log_index + 1
+                # that the leader did not explicitly send (stale tail).
+                cutoff = prev_log_index + 1
+                if len(self.raft_log) > cutoff:
+                    self.raft_log = self.raft_log[:cutoff]
+
             # --- Append new entries ---
             for entry in entries:
                 idx = entry["index"]
@@ -436,7 +454,22 @@ class RaftNode:
         threading.Thread(target=self._heartbeat_loop,
                          daemon=True, name="raft-heartbeat").start()
 
-        # Send an immediate heartbeat to assert leadership right away
+        # Raft paper Section 5.4.2: append a no-op entry immediately.
+        # This forces commit_index to advance on all followers right away,
+        # which (a) flushes out any stale uncommitted entries on followers,
+        # and (b) ensures entries from previous terms are committed
+        # incrementally rather than in one large batch when the first real
+        # entry arrives.  Without this, disk files can diverge in layout.
+        no_op = {
+            "index": len(self.raft_log),
+            "term":  self.current_term,
+            "type":  "NO_OP",
+            "topic": "",
+            "data":  "",
+            "ts":    time.strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        self.raft_log.append(no_op)
+        print(f"[RAFT {self.node_id}] Appended NO_OP at index {no_op['index']} (term={self.current_term})")
         self._queue_replicate_all()
 
     # =========================================================================
@@ -604,6 +637,11 @@ class RaftNode:
         entry_type = entry.get("type")
         topic      = entry.get("topic", "")
         data       = entry.get("data", "")
+
+        if entry_type == "NO_OP":
+            # No-op entries exist only to advance commit_index on all nodes.
+            # They carry no application data and must not touch the disk log.
+            return
 
         if entry_type == "CREATE_TOPIC":
             created = self.log_store.create_topic(topic)

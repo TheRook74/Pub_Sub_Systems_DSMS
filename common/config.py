@@ -13,9 +13,9 @@
 # TCP 'port' number.  When running everything on one machine (localhost), we
 # give each broker a different port so they don't clash.
 BROKERS = [
-    {"id": 0, "host": "127.0.0.1", "port": 5000},
-    {"id": 1, "host": "127.0.0.1", "port": 5001},
-    {"id": 2, "host": "127.0.0.1", "port": 5002},
+    {"id": 0, "host": "10.145.2.166", "port": 5000},
+    {"id": 1, "host": "10.145.9.145", "port": 5001},
+    {"id": 2, "host": "10.145.44.49", "port": 5002},
 ]
 
 # ---------------------------------------------------------------------------
@@ -25,8 +25,8 @@ BROKERS = [
 # the leader is dead and starting a new election.
 # We pick a RANDOM value in [MIN, MAX] so all nodes don't time out at exactly
 # the same moment (which would cause a "split vote" where nobody wins).
-ELECTION_TIMEOUT_MIN = 2.0   # seconds
-ELECTION_TIMEOUT_MAX = 4.0   # seconds
+ELECTION_TIMEOUT_MIN = 7.5   # seconds  — 10× heartbeat as per RAFT paper
+ELECTION_TIMEOUT_MAX = 15.0  # seconds  — 2× the min for good spread
 
 # HEARTBEAT_INTERVAL: how often (in seconds) the current leader broadcasts
 # a heartbeat/replication message to followers.
