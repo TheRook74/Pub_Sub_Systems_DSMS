@@ -1,8 +1,8 @@
 {
-    "server_id": "server1",
+    "server_id": "server0",
     "apps": [
-        "python",
-        "chrome",
-        "code"
+        "brave",
+        "whatsapp",
+        "msedge"
     ]
 }

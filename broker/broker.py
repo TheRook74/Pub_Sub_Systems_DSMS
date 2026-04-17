@@ -192,12 +192,12 @@ class Broker:
             conn.sendall(protocol.encode_nack(leader_port).encode())
             return
 
-        # Fast path: topic already committed by a previous call
-        if self.log_store.topic_exists(topic):
-            conn.sendall(protocol.encode_ack().encode())
-            return
-
-        # Propose through RAFT so ALL brokers create the topic atomically
+        # Always propose through RAFT — even if the topic file already exists
+        # on this leader's disk.  Otherwise, on a restart with stale broker_data,
+        # the leader would short-circuit with an ACK while followers (with clean
+        # disks) never receive the CREATE_TOPIC entry.  They would then refuse
+        # subsequent METRICs with "unknown topic" warnings.
+        # LogStore.create_topic() is idempotent, so re-applying is safe.
         idx = self.raft.propose("CREATE_TOPIC", topic)
         if idx < 0:
             # We lost leadership between the is_leader() check and propose()

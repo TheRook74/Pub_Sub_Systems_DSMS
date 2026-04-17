@@ -109,13 +109,24 @@ class RaftNode:
         self._lock = threading.Lock()
 
         # ----------------------------------------------------------------
-        # Outgoing message queue
-        # A background sender thread dequeues (peer_id, message) pairs and
-        # sends them.  This way we NEVER call the network while holding
-        # self._lock, which would risk a deadlock.
+        # Outgoing message queues — ONE PER PEER
+        # A separate background sender thread drains each peer's queue.
+        # This is critical: if a peer is dead, socket.connect() blocks for
+        # ~1s on every send.  With a single shared queue, that one dead peer
+        # would slow down sends to ALL other peers, stalling commits even
+        # though we still have a quorum.  Per-peer queues isolate failures
+        # so a dead peer only delays its own queue, never the live ones.
         # ----------------------------------------------------------------
-        self._send_queue = queue.Queue()
-        threading.Thread(target=self._send_worker, daemon=True, name="raft-sender").start()
+        self._peer_queues = {}
+        for peer_id in self.peers:
+            q = queue.Queue()
+            self._peer_queues[peer_id] = q
+            threading.Thread(
+                target=self._peer_send_worker,
+                args=(peer_id, q),
+                daemon=True,
+                name=f"raft-sender-{peer_id}",
+            ).start()
 
         # ----------------------------------------------------------------
         # Election Timer State
@@ -521,19 +532,30 @@ class RaftNode:
                     # (LogStore uses its own internal lock so this is fine)
                     self._apply_entry(entry)
 
-    def _send_worker(self):
+    def _peer_send_worker(self, peer_id: int, q: "queue.Queue"):
         """
-        Background thread that drains the outgoing message queue and sends
-        each (peer_id, message) pair to the corresponding broker.
-        By doing this outside self._lock, we avoid holding the lock during
-        potentially slow network operations.
+        Background thread dedicated to ONE peer.  Drains that peer's queue
+        and sends messages serially to it.  If this peer is dead, only THIS
+        thread blocks — other peers' workers are unaffected.
+
+        We also collapse a backlog: if many heartbeats pile up while the peer
+        is unreachable, we only send the latest one.  This prevents the
+        queue from growing without bound during long outages.
         """
         while True:
-            peer_id, message = self._send_queue.get()
+            peer_id_x, message = q.get()
+            # Drain any extra messages — keep only the most recent.  When a
+            # peer recovers, sending a stale heartbeat from 30s ago is
+            # useless; sending the current one is what matters.
+            while True:
+                try:
+                    peer_id_x, message = q.get_nowait()
+                except queue.Empty:
+                    break
             try:
                 self._send_raw(peer_id, message)
-            except Exception as e:
-                # Peer might be down; that's okay — RAFT handles node failures
+            except Exception:
+                # Peer might be down; RAFT handles node failures gracefully.
                 pass
 
     # =========================================================================
@@ -552,10 +574,12 @@ class RaftNode:
 
     def _queue_send(self, peer_id: int, message: str):
         """
-        Enqueue a message to be sent to peer_id.
-        SAFE to call with self._lock held (does not block).
+        Enqueue a message to be sent to peer_id on that peer's dedicated
+        queue.  SAFE to call with self._lock held (does not block).
         """
-        self._send_queue.put((peer_id, message))
+        q = self._peer_queues.get(peer_id)
+        if q is not None:
+            q.put((peer_id, message))
 
     def _queue_replicate_all(self):
         """Send REPLICATE to every follower. Called with lock held."""
@@ -649,10 +673,15 @@ class RaftNode:
                 print(f"[RAFT {self.node_id}] Applied CREATE_TOPIC → '{topic}'")
 
         elif entry_type == "METRIC":
-            if self.log_store.topic_exists(topic):
-                # Pass the timestamp that was recorded by the LEADER at proposal
-                # time — this makes all broker log files byte-identical.
-                ts = entry.get("ts")
-                self.log_store.append(topic, data, ts=ts)
-            else:
-                print(f"[RAFT {self.node_id}] WARNING: METRIC for unknown topic '{topic}' — ignoring")
+            # Self-heal: if the topic file is missing on this node (e.g. this
+            # node joined the cluster after the CREATE_TOPIC was committed, or
+            # broker_data was wiped), create it on demand.  The committed RAFT
+            # log is the source of truth — if a METRIC reached commit, the
+            # topic must logically exist.
+            if not self.log_store.topic_exists(topic):
+                self.log_store.create_topic(topic)
+                print(f"[RAFT {self.node_id}] Auto-created missing topic '{topic}' before applying METRIC")
+            # Pass the timestamp that was recorded by the LEADER at proposal
+            # time — this makes all broker log files byte-identical.
+            ts = entry.get("ts")
+            self.log_store.append(topic, data, ts=ts)
