@@ -1,363 +1,222 @@
 # =============================================================================
-# subscriber/dsms_sub.py  —  DSMS Subscriber Application (DSMS_SUB)
+# subscriber/dsms_sub.py  -  DSMS Subscriber Application (DSMS_SUB)
 #
-# DSMS_SUB is the subscriber side of the pub-sub system.
-# It has TWO parts running concurrently:
+# Design (new):
+#   Every POST /subscribe?topic=<pattern> spawns ONE dedicated Subscription:
+#     * its own background thread
+#     * its own output file  (subscriber_output/<pattern>_<ts>_sub<id>.log)
+#     * its own {concrete topic -> byte offset} dict, each offset starting
+#       at 0 so the file captures the full history present on the broker
+#       at the time of subscribe AND every new entry from then onwards
+#     * its own stop flag, set by DELETE /subscribe
 #
-#   PART A — Broker Poller (one background thread per *concrete* topic):
-#     Periodically sends SUBSCRIBE <topic> <offset> to the broker leader.
-#     The broker returns DATA with new log entries, which are stored in
-#     the LogManager.
+#   Subscriptions never share state.  Two POSTs for the same pattern
+#   produce two independent threads, two independent files, and two
+#   independent offset maps.  Because offsets start at 0, the two files
+#   are byte-for-byte equivalent modulo the moments they were created.
 #
-#   PART B — Pattern Reconciler (one background thread total):
-#     Every POLL_INTERVAL seconds it asks the broker LIST_TOPICS <pattern>
-#     for every active pattern the user subscribed to, and spawns pollers
-#     for any newly-created concrete topics.  This is how the subscriber
-#     picks up new apps / new servers added while it is already running.
+# HTTP API:
+#   POST   /subscribe?topic=<pattern>      create a subscription
+#   DELETE /subscribe?id=<id>              stop one subscription
+#   DELETE /subscribe?topic=<pattern>      stop every subscription for a pattern
+#   GET    /status                         list all live subscriptions
 #
-#   PART C — HTTP REST API (Flask web server):
-#     Clients (dashboards, alert tools, humans) query this HTTP server
-#     to read the collected metrics.  No direct broker contact needed.
-#
-# HTTP API Endpoints:
-#   POST   /subscribe?topic=<pattern>  -> watch a topic OR a pattern
-#   DELETE /subscribe?topic=<pattern>  -> stop watching a pattern
-#   GET    /logs?topic=<topic>         -> get all entries (supports aggregation)
-#   GET    /status                     -> show all subscriptions + entry counts
-#
-# Pattern vs. concrete topic:
-#   brave.server0   (concrete)     -> one file on disk
-#   brave           (app prefix)   -> every brave.* topic
-#   server0         (server suffix)-> every *.server0 topic
-#
-# The subscriber accepts any of the three forms on /subscribe.  It asks
-# the broker to expand the pattern via LIST_TOPICS and then manages one
-# poller per concrete topic under the hood.  Reference counting keeps
-# things tidy when multiple patterns overlap on the same concrete topic.
-#
-# PER-PATTERN OUTPUT FILES
-# ------------------------
-# Every POST /subscribe creates a fresh log file under subscriber_output/,
-# e.g. subscribe to both "python.server0" and "server0" produces:
-#   subscriber_output/python.server0.log
-#   subscriber_output/server0.log
-# Each JSON line in these files is the raw broker entry prefixed with
-# {"topic": "<concrete topic>", ...} so aggregated files remain readable.
-# Only new bytes ever get appended; no entry is ever written twice to the
-# same file.  The same entry can appear in two different files only when
-# it legitimately matches both patterns (e.g. python.server0 matches both
-# "python.server0" and "server0").
-#
-# Example curl commands:
-#   curl -X POST   "http://localhost:8080/subscribe?topic=brave.server0"
-#   curl -X POST   "http://localhost:8080/subscribe?topic=server0"
-#   curl          "http://localhost:8080/logs?topic=server0"
-#   curl          "http://localhost:8080/status"
+# Patterns supported on /subscribe:
+#   brave.server0   (exact concrete topic)
+#   brave           (app prefix   -> every brave.* topic)
+#   server0         (server suffix-> every *.server0 topic)
+#   The broker resolves them via LIST_TOPICS; new concrete topics that
+#   show up after the subscription is created are picked up on the next
+#   poll cycle and also start at offset 0 inside that file.
 # =============================================================================
 
+import argparse
 import json
+import os
 import re
 import socket
+import sys
 import threading
 import time
-import sys
-import os
-import argparse
+from datetime import datetime
 
-# Flask is a lightweight Python web framework for building HTTP APIs.
-from flask import Flask, request, jsonify
+from flask import Flask, jsonify, request
 
-# Allow imports from the parent 'dsms' package
+# Allow imports from the parent 'dsms' package.
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from common import config, protocol
-from subscriber.log_manager import LogManager
 
 
 # =============================================================================
-# File-output helpers
+# Output directory + filename helpers
 # =============================================================================
 
-# Directory where one .log file per active pattern is stored.
-# Lives beside the 'subscriber' package so it is easy to inspect / clean.
 OUTPUT_DIR = os.path.abspath(
     os.path.join(os.path.dirname(__file__), "..", "subscriber_output")
 )
 
 
 def _sanitize_pattern(pattern: str) -> str:
-    """
-    Turn an arbitrary user-supplied pattern into a safe filesystem name.
-    Anything that is not a letter / digit / dot / dash / underscore becomes '_'.
-    """
+    """Turn a pattern into a safe filesystem fragment."""
     return re.sub(r"[^A-Za-z0-9._-]", "_", pattern)
 
 
-# =============================================================================
-# Subscriber class
-# =============================================================================
-
-class Subscriber:
+def _build_output_filename(sub_id: int, pattern: str, created_at: datetime) -> str:
     """
-    DSMS_SUB: pulls metric data from the broker cluster and exposes it
-    via an HTTP REST API.
+    Produce a unique filename per subscription.
+    Example: brave.server0_2026-04-04_12-34-56_sub3.log
+    """
+    ts = created_at.strftime("%Y-%m-%d_%H-%M-%S")
+    return f"{_sanitize_pattern(pattern)}_{ts}_sub{sub_id}.log"
+
+
+# =============================================================================
+# Subscription: one thread, one file, one offsets map
+# =============================================================================
+
+class Subscription:
+    """
+    A single /subscribe request incarnated as a background worker.
+
+    Each instance is fully self-contained: stopping one does not affect any
+    other subscription, even another one with the exact same pattern.
     """
 
-    def __init__(self, http_port: int = config.SUBSCRIBER_HTTP_PORT):
-        self.http_port = http_port
-        self.log_mgr = LogManager()
+    def __init__(self, sub_id: int, pattern: str, subscriber: "Subscriber"):
+        self.id = sub_id
+        self.pattern = pattern
+        self.created_at = datetime.now()
+        self._subscriber = subscriber   # back-ref used only for shared network helpers
 
-        # Poller threads for concrete topics. topic -> Thread.
-        self._poller_threads: dict = {}
+        # Offsets: concrete_topic -> next byte to fetch from broker.
+        # All new topics enter with 0 so the file captures full history.
+        self._offsets: dict = {}
+        self._offsets_lock = threading.Lock()
 
-        # Patterns the user explicitly subscribed to.
-        self._active_patterns: set = set()
-
-        # Reference count: concrete_topic -> set of patterns that claim it.
-        # Used when unsubscribing a pattern so we do not kill pollers that
-        # another active pattern is still interested in.
-        self._topic_refs: dict = {}
-
-        # Guards _active_patterns and _topic_refs (separate from LogManager's lock).
-        self._patterns_lock = threading.Lock()
-
-        # One open log file per active pattern.  pattern -> file handle (wb+/ab).
-        # Each entry received by any poller is tagged with its concrete topic
-        # and appended to every pattern file whose pattern currently covers it.
-        self._pattern_files: dict = {}
+        # Open the output file right now so /status and `ls` see it
+        # immediately after POST returns, even before the first poll runs.
+        self.file_path = os.path.join(
+            OUTPUT_DIR,
+            _build_output_filename(self.id, self.pattern, self.created_at),
+        )
+        # "wb" truncates — each subscribe is a fresh file.  Subsequent
+        # writes are always append-from-end in the same handle, so the
+        # file only ever grows, no row is ever rewritten.
+        self._fh = open(self.file_path, "wb")
         self._file_lock = threading.Lock()
 
-        # Make sure the output directory exists before any subscribe arrives.
-        os.makedirs(OUTPUT_DIR, exist_ok=True)
-
-        # Known leader port — starts unknown, filled in after first contact.
-        self._leader_port = None
-        self._leader_lock = threading.Lock()
-
-        # Set up the Flask HTTP application.
-        self.app = Flask(__name__)
-        self._register_routes()
-
-        # Kick off the reconciler thread.  It discovers new concrete topics
-        # for every active pattern once per POLL_INTERVAL.
-        threading.Thread(
-            target=self._reconciler_loop,
+        self._stop_event = threading.Event()
+        self._thread = threading.Thread(
+            target=self._run,
             daemon=True,
-            name="pattern-reconciler",
-        ).start()
+            name=f"sub{self.id}-{pattern}",
+        )
+        self._thread.start()
 
-    # =========================================================================
-    # HTTP API Routes
-    # =========================================================================
+    # ------------------------------------------------------------------ control
 
-    def _register_routes(self):
-        """Attach all URL routes to the Flask app."""
-        app = self.app
+    def stop(self):
+        """Signal the thread to exit.  Safe to call more than once."""
+        self._stop_event.set()
 
-        # ---- POST /subscribe?topic=<pattern> ----
-        @app.route("/subscribe", methods=["POST"])
-        def subscribe():
-            topic = request.args.get("topic", "").strip()
-            if not topic:
-                return jsonify({"error": "Missing 'topic' query parameter"}), 400
+    def alive(self) -> bool:
+        return self._thread.is_alive()
 
-            matched = self._subscribe_pattern(topic)
-            return jsonify({
-                "status": "subscribed",
-                "pattern": topic,
-                "matched_topics": matched,
-            }), 200
+    # ----------------------------------------------------------------- status
 
-        # ---- DELETE /subscribe?topic=<pattern> ----
-        @app.route("/subscribe", methods=["DELETE"])
-        def unsubscribe():
-            topic = request.args.get("topic", "").strip()
-            if not topic:
-                return jsonify({"error": "Missing 'topic' query parameter"}), 400
+    def snapshot(self) -> dict:
+        """Return a JSON-safe description used by /status."""
+        with self._offsets_lock:
+            offsets = dict(self._offsets)
+        return {
+            "id":         self.id,
+            "pattern":    self.pattern,
+            "created_at": self.created_at.strftime("%Y-%m-%d %H:%M:%S"),
+            "file":       self.file_path,
+            "alive":      self.alive(),
+            "topics":     offsets,   # {concrete_topic: last_known_offset}
+        }
 
-            removed = self._unsubscribe_pattern(topic)
-            return jsonify({
-                "status": "unsubscribed",
-                "pattern": topic,
-                "dropped_topics": removed,
-            }), 200
+    # --------------------------------------------------------------- main loop
 
-        # ---- GET /logs?topic=<topic> ----
-        @app.route("/logs", methods=["GET"])
-        def get_logs():
-            """
-            Return all cached log entries for a topic or topic prefix/suffix.
-
-            ?topic=python.server1   → only that exact leaf topic
-            ?topic=python           → aggregated from ALL python.* topics
-            ?topic=server1          → aggregated from ALL *.server1 topics
-            """
-            topic = request.args.get("topic", "").strip()
-            if not topic:
-                return jsonify({"error": "Missing 'topic' query parameter"}), 400
-
-            entries = self.log_mgr.get_entries(topic)
-            return jsonify({
-                "topic":       topic,
-                "entry_count": len(entries),
-                "entries":     entries,
-            }), 200
-
-        # ---- GET /status ----
-        @app.route("/status", methods=["GET"])
-        def get_status():
-            """Show all active subscriptions and how many entries are cached."""
-            with self._patterns_lock:
-                patterns = sorted(self._active_patterns)
-            with self._file_lock:
-                output_files = {
-                    p: os.path.join(OUTPUT_DIR, f"{_sanitize_pattern(p)}.log")
-                    for p in self._pattern_files
-                }
-            return jsonify({
-                "patterns":      patterns,
-                "output_files":  output_files,
-                "subscriptions": self.log_mgr.get_all_status(),
-                "leader_port":   self._leader_port,
-            }), 200
-
-    # =========================================================================
-    # Pattern-level subscribe / unsubscribe
-    # =========================================================================
-
-    def _subscribe_pattern(self, pattern: str) -> list:
+    def _run(self):
         """
-        Register a pattern, ask the broker which concrete topics match it,
-        and start a poller for each one that is not already polled.
-        Returns the list of concrete topics that were attached.
+        Loop body:
+          1. Expand the pattern via LIST_TOPICS (every cycle -> picks up new
+             concrete topics that were created after we subscribed).
+          2. Register every newly-discovered topic at offset 0.
+          3. Poll each known topic at its current offset, append new rows to
+             the file, update the offset.
+          4. Sleep POLL_INTERVAL (abortable via _stop_event).
         """
-        with self._patterns_lock:
-            self._active_patterns.add(pattern)
+        print(f"[SUB#{self.id}] Started | pattern='{self.pattern}' "
+              f"| file='{self.file_path}'")
 
-        # Open (truncate) this pattern's output file if it is brand new.
-        # The file is appended to, not rewritten, so no duplicate entries
-        # are ever produced even though multiple pollers may share a file.
-        self._open_pattern_file(pattern)
-
-        # Network call is done outside the lock so HTTP calls never block each
-        # other on a slow broker.
-        concrete = self._list_topics_from_broker(pattern)
-
-        self._attach_concrete_topics(pattern, concrete)
-
-        if not concrete:
-            # Pattern is valid but nothing matches yet (e.g. a server whose
-            # publishers have not started).  Reconciler will pick it up later.
-            print(f"[SUB] Pattern '{pattern}' registered; no matching topics yet")
-        else:
-            print(f"[SUB] Pattern '{pattern}' expanded to {len(concrete)} topic(s): {concrete}")
-
-        return concrete
-
-    def _unsubscribe_pattern(self, pattern: str) -> list:
-        """
-        Drop a pattern.  For each concrete topic whose last remaining
-        claiming pattern was this one, stop its poller and discard cached
-        entries.  Returns the list of topics that were dropped.
-        """
-        dropped = []
-        with self._patterns_lock:
-            self._active_patterns.discard(pattern)
-
-            # Walk the ref table and remove this pattern from each entry.
-            topics_to_check = list(self._topic_refs.keys())
-            for topic in topics_to_check:
-                refs = self._topic_refs.get(topic, set())
-                refs.discard(pattern)
-                if not refs:
-                    # Nobody still wants this concrete topic — unsubscribe it.
-                    self._topic_refs.pop(topic, None)
-                    dropped.append(topic)
-
-        # LogManager.unsubscribe is idempotent and its poll loop exits on
-        # the next iteration when is_subscribed returns False.
-        for topic in dropped:
-            self.log_mgr.unsubscribe(topic)
-
-        # Close this pattern's output file but leave the data on disk so
-        # the user can still inspect everything that was collected.
-        self._close_pattern_file(pattern)
-
-        if dropped:
-            print(f"[SUB] Pattern '{pattern}' dropped, stopped {len(dropped)} poller(s): {dropped}")
-        else:
-            print(f"[SUB] Pattern '{pattern}' dropped (no pollers to stop)")
-
-        return dropped
-
-    def _attach_concrete_topics(self, pattern: str, concrete: list):
-        """
-        Shared helper: add a pattern ref for each concrete topic and make
-        sure a poller exists.  Called from both the initial subscribe and
-        the periodic reconciler.
-        """
-        new_pollers = []
-        with self._patterns_lock:
-            for topic in concrete:
-                refs = self._topic_refs.setdefault(topic, set())
-                if pattern not in refs:
-                    refs.add(pattern)
-                # LogManager.subscribe is idempotent.
-                # _start_poller is idempotent (checks _poller_threads).
-                if topic not in self._poller_threads:
-                    new_pollers.append(topic)
-
-        for topic in new_pollers:
-            self.log_mgr.subscribe(topic)
-            self._start_poller(topic)
-
-    # =========================================================================
-    # Per-pattern output files
-    # =========================================================================
-
-    def _open_pattern_file(self, pattern: str):
-        """
-        Open (creating / truncating) the log file for this pattern.
-        No-op if a handle already exists — multiple POSTs to /subscribe
-        for the same pattern never reset the file.
-        """
-        with self._file_lock:
-            if pattern in self._pattern_files:
-                return
-            filepath = os.path.join(OUTPUT_DIR, f"{_sanitize_pattern(pattern)}.log")
-            # "wb" = fresh file on a new subscribe, so old content from a
-            # previous run never mingles with new data.
-            fh = open(filepath, "wb")
-            self._pattern_files[pattern] = fh
-        print(f"[SUB] Output file ready: {filepath}")
-
-    def _close_pattern_file(self, pattern: str):
-        """Flush and close the file handle for a pattern, keep the file on disk."""
-        with self._file_lock:
-            fh = self._pattern_files.pop(pattern, None)
-        if fh:
+        while not self._stop_event.is_set():
             try:
-                fh.flush()
-                fh.close()
-            except OSError:
-                pass
+                self._poll_once()
+            except Exception as e:
+                # Don't let a transient network / parse error kill the thread.
+                print(f"[SUB#{self.id}] Poll error (continuing): {e}")
 
-    def _write_entries_to_files(self, topic: str, raw_bytes: bytes):
+            # _stop_event.wait returns True if we were told to stop.
+            if self._stop_event.wait(timeout=config.POLL_INTERVAL):
+                break
+
+        # Clean shutdown: flush + close the file so partial buffers don't
+        # get lost on exit.
+        try:
+            with self._file_lock:
+                self._fh.flush()
+                self._fh.close()
+        except OSError:
+            pass
+        print(f"[SUB#{self.id}] Stopped")
+
+    def _poll_once(self):
+        """One iteration of the loop: discover + poll + write."""
+        # 1. Discover concrete topics that currently match the pattern.
+        concrete = self._subscriber.list_topics_from_broker(self.pattern)
+
+        with self._offsets_lock:
+            # 2. Bring any new topics into our tracking map at offset 0.
+            for t in concrete:
+                if t not in self._offsets:
+                    self._offsets[t] = 0
+                    print(f"[SUB#{self.id}] Tracking new topic '{t}' from offset 0")
+            # Snapshot what to poll this cycle.
+            topics_to_poll = list(self._offsets.items())
+
+        # 3. Pull new bytes for each topic and append to our file.
+        for topic, offset in topics_to_poll:
+            if self._stop_event.is_set():
+                return
+            self._fetch_topic(topic, offset)
+
+    def _fetch_topic(self, topic: str, start_offset: int):
         """
-        Called once per successful poll of a concrete topic.  Tags every JSON
-        line from the broker with its source topic and appends the block to
-        the output file of each pattern that currently claims this topic.
-
-        IMPORTANT — de-dup guarantee:
-          The broker only returns bytes from (old_offset, new_offset], so we
-          are writing strictly new data.  Within a single pattern's file we
-          can never see the same entry twice.  Two different pattern files
-          can and SHOULD contain the same entry (it is a valid match for
-          both patterns — they are independent views).
+        SUBSCRIBE a single concrete topic, write whatever new bytes the
+        broker returned to this subscription's file, then advance the
+        offset so the next cycle picks up from where this one ended.
         """
-        if not raw_bytes:
-            return
+        result = self._subscriber.fetch_topic_bytes(topic, start_offset)
+        if result is None:
+            return  # broker unreachable this cycle; will retry
+        new_offset, raw_content = result
 
+        if raw_content:
+            self._write_raw_to_file(topic, raw_content)
+
+        with self._offsets_lock:
+            self._offsets[topic] = new_offset
+
+    def _write_raw_to_file(self, topic: str, raw_bytes: bytes):
+        """
+        Tag each JSON line with its source topic (needed so aggregated
+        files like server0_*.log remain unambiguous) and append the
+        block as one write.
+        """
         tagged_lines = []
         for line in raw_bytes.decode("utf-8", errors="replace").splitlines():
             line = line.strip()
@@ -367,8 +226,6 @@ class Subscriber:
                 entry = json.loads(line)
             except json.JSONDecodeError:
                 continue
-            # Prepend the source topic so aggregated pattern files remain
-            # readable (e.g. server0.log shows brave.server0, code.server0, ...).
             tagged = {"topic": topic, **entry}
             tagged_lines.append(json.dumps(tagged))
 
@@ -376,67 +233,149 @@ class Subscriber:
             return
         payload = ("\n".join(tagged_lines) + "\n").encode("utf-8")
 
-        # Snapshot the patterns claiming this topic so we don't hold the
-        # patterns_lock while doing disk I/O.
-        with self._patterns_lock:
-            claiming_patterns = list(self._topic_refs.get(topic, set()))
-
-        if not claiming_patterns:
-            return
-
         with self._file_lock:
-            for p in claiming_patterns:
-                fh = self._pattern_files.get(p)
-                if fh is None:
-                    continue
-                try:
-                    fh.write(payload)
-                    fh.flush()
-                except OSError as e:
-                    print(f"[SUB] Output file write failed for '{p}': {e}")
-
-    # =========================================================================
-    # Reconciler — picks up topics created AFTER a pattern was registered
-    # =========================================================================
-
-    def _reconciler_loop(self):
-        """
-        Runs forever in the background.  Every POLL_INTERVAL seconds it asks
-        the broker LIST_TOPICS for each active pattern and attaches any new
-        concrete topics.  This is the only place where a late-joining publisher
-        is discovered.
-        """
-        while True:
-            time.sleep(config.POLL_INTERVAL)
+            if self._fh.closed:
+                return
             try:
-                with self._patterns_lock:
-                    patterns = list(self._active_patterns)
-                for pattern in patterns:
-                    concrete = self._list_topics_from_broker(pattern)
-                    if concrete:
-                        self._attach_concrete_topics(pattern, concrete)
-            except Exception as e:
-                print(f"[SUB] Reconciler error (continuing): {e}")
+                self._fh.write(payload)
+                self._fh.flush()
+            except OSError as e:
+                print(f"[SUB#{self.id}] Write error: {e}")
 
-    # =========================================================================
-    # Broker call: LIST_TOPICS
-    # =========================================================================
 
-    def _list_topics_from_broker(self, pattern: str) -> list:
+# =============================================================================
+# Subscriber: HTTP layer + shared leader discovery + subscription registry
+# =============================================================================
+
+class Subscriber:
+    """
+    HTTP frontend that owns all Subscription instances.
+
+    Only global state kept here is:
+      * the registry of live subscriptions (by id)
+      * the shared "last known leader port" so that every Subscription
+        benefits when any one of them discovers the current RAFT leader
+    """
+
+    def __init__(self, http_port: int = config.SUBSCRIBER_HTTP_PORT):
+        self.http_port = http_port
+
+        os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+        self._subs: dict = {}                 # sub_id -> Subscription
+        self._subs_lock = threading.Lock()
+        self._next_sub_id = 1
+
+        self._leader_port = None
+        self._leader_lock = threading.Lock()
+
+        self.app = Flask(__name__)
+        self._register_routes()
+
+    # ------------------------------------------------------------------ routes
+
+    def _register_routes(self):
+        app = self.app
+
+        # POST /subscribe?topic=<pattern>
+        @app.route("/subscribe", methods=["POST"])
+        def subscribe():
+            pattern = request.args.get("topic", "").strip()
+            if not pattern:
+                return jsonify({"error": "Missing 'topic' query parameter"}), 400
+
+            sub = self._spawn_subscription(pattern)
+            return jsonify({
+                "status":          "subscribed",
+                "subscription_id": sub.id,
+                "pattern":         sub.pattern,
+                "file":            sub.file_path,
+                "created_at":      sub.created_at.strftime("%Y-%m-%d %H:%M:%S"),
+            }), 200
+
+        # DELETE /subscribe?id=<id>  OR  DELETE /subscribe?topic=<pattern>
+        @app.route("/subscribe", methods=["DELETE"])
+        def unsubscribe():
+            raw_id = request.args.get("id", "").strip()
+            pattern = request.args.get("topic", "").strip()
+
+            if not raw_id and not pattern:
+                return jsonify({
+                    "error": "Provide either 'id' (one subscription) "
+                             "or 'topic' (every subscription for that pattern)",
+                }), 400
+
+            stopped = []
+
+            if raw_id:
+                try:
+                    sid = int(raw_id)
+                except ValueError:
+                    return jsonify({"error": f"Invalid id '{raw_id}'"}), 400
+                with self._subs_lock:
+                    sub = self._subs.pop(sid, None)
+                if sub is None:
+                    return jsonify({"error": f"No subscription with id={sid}"}), 404
+                sub.stop()
+                stopped.append(sub.id)
+            else:
+                with self._subs_lock:
+                    ids = [sid for sid, s in self._subs.items() if s.pattern == pattern]
+                    subs = [self._subs.pop(sid) for sid in ids]
+                for s in subs:
+                    s.stop()
+                    stopped.append(s.id)
+
+            return jsonify({
+                "status":  "unsubscribed",
+                "stopped": stopped,
+            }), 200
+
+        # GET /status
+        @app.route("/status", methods=["GET"])
+        def status():
+            with self._subs_lock:
+                subs = [s.snapshot() for s in self._subs.values()]
+            return jsonify({
+                "leader_port":   self._leader_port,
+                "subscriptions": subs,
+            }), 200
+
+    # ------------------------------------------------------- subscription mgmt
+
+    def _spawn_subscription(self, pattern: str) -> Subscription:
+        """Allocate an id and launch a new Subscription thread."""
+        with self._subs_lock:
+            sub_id = self._next_sub_id
+            self._next_sub_id += 1
+
+        # Subscription construction opens the file and starts the thread.
+        sub = Subscription(sub_id, pattern, self)
+
+        with self._subs_lock:
+            self._subs[sub_id] = sub
+
+        print(f"[SUB] Created subscription #{sub.id} pattern='{pattern}' "
+              f"file='{sub.file_path}'")
+        return sub
+
+    # ======================================================================
+    # Broker network helpers (shared across all Subscription instances)
+    # ======================================================================
+
+    def list_topics_from_broker(self, pattern: str) -> list:
         """
-        Ask the broker leader for every concrete topic that matches a pattern.
-        Handles NACK redirects and falls back through config.BROKERS.
-        Returns an empty list if every broker is unreachable or the pattern
-        matches nothing.
+        Ask the RAFT leader for every concrete topic matching a pattern.
+        Returns an empty list if every broker is unreachable or nothing
+        matches.  Updates _leader_port as a side effect so subsequent
+        calls go directly to the leader.
         """
         message = protocol.encode_list_topics(pattern)
-
-        for host, port in self._get_broker_candidates():
+        for host, port in self._broker_candidates():
             try:
                 with socket.create_connection((host, port), timeout=5.0) as s:
                     s.sendall(message.encode())
                     line = protocol.recv_line(s)
-
                 if line is None:
                     continue
                 msg_type, payload = protocol.decode_message(line)
@@ -446,7 +385,7 @@ class Subscriber:
                     if leader_port > 0:
                         with self._leader_lock:
                             self._leader_port = leader_port
-                    continue  # retry with updated leader
+                    continue  # retry at the hinted leader
 
                 if msg_type == "TOPICS":
                     with self._leader_lock:
@@ -455,73 +394,23 @@ class Subscriber:
 
                 print(f"[SUB] Unexpected LIST_TOPICS response: {msg_type}")
                 return []
-
             except (ConnectionRefusedError, socket.timeout, OSError) as e:
-                print(f"[SUB] LIST_TOPICS cannot reach {host}:{port} — {e}")
+                print(f"[SUB] LIST_TOPICS cannot reach {host}:{port} - {e}")
                 with self._leader_lock:
                     if self._leader_port == port:
                         self._leader_port = None
-
         return []
 
-    # =========================================================================
-    # Single-topic Poller (unchanged behavior from before)
-    # =========================================================================
-
-    def _start_poller(self, topic: str):
+    def fetch_topic_bytes(self, topic: str, byte_offset: int):
         """
-        Start a background thread that periodically polls the broker
-        for new log entries for 'topic'.  Idempotent.
+        Send SUBSCRIBE <topic> <byte_offset> and return (new_offset, raw_bytes).
+        Returns None if no broker could serve the request this cycle.
         """
-        if topic in self._poller_threads:
-            t = self._poller_threads[topic]
-            if t.is_alive():
-                return  # already running
-
-        t = threading.Thread(
-            target=self._poll_loop,
-            args=(topic,),
-            daemon=True,
-            name=f"poller-{topic}",
-        )
-        self._poller_threads[topic] = t
-        t.start()
-        print(f"[SUB] Started poller thread for '{topic}'")
-
-    def _poll_loop(self, topic: str):
-        """
-        Every POLL_INTERVAL seconds, fetch new entries for this concrete topic.
-        Stops automatically when the topic is unsubscribed.
-        """
-        print(f"[SUB] Poller active for '{topic}'")
-        while self.log_mgr.is_subscribed(topic):
-            try:
-                self._fetch_new_entries(topic)
-            except Exception as e:
-                print(f"[SUB] Poller error for '{topic}': {e}")
-            time.sleep(config.POLL_INTERVAL)
-        # Clean up so _start_poller can restart this topic later if needed.
-        self._poller_threads.pop(topic, None)
-        print(f"[SUB] Poller stopped for '{topic}'")
-
-    def _fetch_new_entries(self, topic: str):
-        """
-        Send one SUBSCRIBE request to the broker and process the DATA response.
-
-        Protocol:
-          → SUBSCRIBE <topic> <byte_offset>\n
-          ← DATA <new_offset>\n
-            <raw log bytes (zero or more JSON lines)>
-          ← [connection closed by broker]
-        """
-        byte_offset = self.log_mgr.get_byte_offset(topic)
         message = protocol.encode_subscribe(topic, byte_offset)
-
-        for host, port in self._get_broker_candidates():
+        for host, port in self._broker_candidates():
             try:
                 with socket.create_connection((host, port), timeout=5.0) as s:
                     s.sendall(message.encode())
-
                     header_line = protocol.recv_line(s)
                     if header_line is None:
                         continue
@@ -533,14 +422,13 @@ class Subscriber:
                         if leader_port > 0:
                             with self._leader_lock:
                                 self._leader_port = leader_port
-                        continue
+                        continue  # retry at hinted leader
 
                     if msg_type != "DATA":
                         print(f"[SUB] Unexpected response type: {msg_type}")
                         continue
 
                     new_offset = payload["new_offset"]
-
                     raw_content = b""
                     while True:
                         chunk = s.recv(4096)
@@ -550,50 +438,27 @@ class Subscriber:
 
                     with self._leader_lock:
                         self._leader_port = port
-
-                    self.log_mgr.update_offset(topic, new_offset)
-                    self.log_mgr.add_raw_bytes(topic, raw_content)
-
-                    # Persist to per-pattern output files so downstream
-                    # tools (or a human) can tail them directly.
-                    self._write_entries_to_files(topic, raw_content)
-
-                    if raw_content:
-                        lines = [l for l in raw_content.decode(
-                            "utf-8", errors="replace").splitlines() if l.strip()]
-                        print(f"[SUB] ◄ Received {len(lines)} new entry/entries "
-                              f"for '{topic}' (offset {byte_offset} → {new_offset})")
-                        for line in lines:
-                            print(f"       {line}")
-                    else:
-                        print(f"[SUB] ◄ Poll '{topic}' — no new data "
-                              f"(offset={byte_offset})")
-
-                    return
-
+                    return new_offset, raw_content
             except (ConnectionRefusedError, socket.timeout, OSError) as e:
-                print(f"[SUB] Cannot reach broker {host}:{port} — {e}")
+                print(f"[SUB] Fetch cannot reach {host}:{port} - {e}")
                 with self._leader_lock:
                     if self._leader_port == port:
                         self._leader_port = None
+        return None
 
-    # =========================================================================
-    # Helpers
-    # =========================================================================
-
-    def _get_broker_candidates(self) -> list:
+    def _broker_candidates(self) -> list:
         """Known leader first, then the rest of the brokers as fallback."""
         with self._leader_lock:
             lp = self._leader_port
 
-        candidates = []
+        ordered = []
         if lp:
-            lh = self._port_to_host(lp)
-            candidates.append((lh, lp))
+            host = self._port_to_host(lp)
+            ordered.append((host, lp))
         for b in config.BROKERS:
             if b["port"] != lp:
-                candidates.append((b["host"], b["port"]))
-        return candidates
+                ordered.append((b["host"], b["port"]))
+        return ordered
 
     def _port_to_host(self, port: int) -> str:
         for b in config.BROKERS:
@@ -601,17 +466,19 @@ class Subscriber:
                 return b["host"]
         return config.BROKERS[0]["host"]
 
-    # =========================================================================
-    # Run
-    # =========================================================================
+    # --------------------------------------------------------------------- run
 
     def run(self):
         """Start the Flask HTTP server (blocking)."""
         print(f"[SUB] HTTP API running at http://127.0.0.1:{self.http_port}")
-        print(f"[SUB] Subscribe to a topic (exact, app-prefix, or server-suffix):")
+        print(f"[SUB] Output directory: {OUTPUT_DIR}")
+        print(f"[SUB] Subscribe (each call spawns its own thread + file):")
         print(f"       curl -X POST 'http://localhost:{self.http_port}/subscribe?topic=brave.server0'")
         print(f"       curl -X POST 'http://localhost:{self.http_port}/subscribe?topic=server0'")
         print(f"       curl -X POST 'http://localhost:{self.http_port}/subscribe?topic=brave'")
+        print(f"[SUB] Unsubscribe by id or by pattern:")
+        print(f"       curl -X DELETE 'http://localhost:{self.http_port}/subscribe?id=1'")
+        print(f"       curl -X DELETE 'http://localhost:{self.http_port}/subscribe?topic=server0'")
         self.app.run(host="0.0.0.0", port=self.http_port,
                      debug=False, use_reloader=False)
 
@@ -621,7 +488,7 @@ class Subscriber:
 # =============================================================================
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="DSMS Subscriber — HTTP API for reading metrics.")
+    parser = argparse.ArgumentParser(description="DSMS Subscriber - per-subscribe thread + file.")
     parser.add_argument(
         "--port", type=int, default=config.SUBSCRIBER_HTTP_PORT,
         help=f"HTTP port for the REST API (default: {config.SUBSCRIBER_HTTP_PORT})",
