@@ -81,6 +81,8 @@ class Broker:
                 self._handle_metric(conn, payload["topic"], payload["data"])
             elif msg_type == "SUBSCRIBE":
                 self._handle_subscribe(conn, payload["topic"], payload["offset"])
+            elif msg_type == "LIST_TOPICS":
+                self._handle_list_topics(conn, payload["pattern"])
             elif msg_type == "VOTE_REQUEST":
                 self.raft.handle_vote_request(
                     payload["term"],
@@ -168,6 +170,35 @@ class Broker:
         conn.sendall(protocol.encode_data_header(new_offset))
         if content_bytes:
             conn.sendall(content_bytes)
+
+    def _handle_list_topics(self, conn: socket.socket, pattern: str):
+        """
+        Resolve a pattern to the concrete topic files that match it.
+
+        Matching rules (same as subscriber-side aggregation):
+          - exact:  "brave.server0"  -> ["brave.server0"] if it exists
+          - prefix: "brave"          -> all topics starting with "brave."
+          - suffix: "server0"        -> all topics ending   with ".server0"
+
+        Only the leader serves this so subscribers always see the newest
+        committed topic set (followers lag a heartbeat behind).
+        """
+        if not self.raft.is_leader():
+            leader_port = self.raft.get_leader_port()
+            conn.sendall(protocol.encode_nack(leader_port).encode())
+            return
+
+        pattern = pattern.strip()
+        matching = []
+        for t in self.log_store.all_topics():
+            if (
+                t == pattern
+                or t.startswith(pattern + ".")
+                or t.endswith("." + pattern)
+            ):
+                matching.append(t)
+
+        conn.sendall(protocol.encode_topics_response(matching).encode())
 
     def _send_to_peer(self, peer_id: int, message: str):
         """Send one message to a peer broker using a short-lived TCP connection."""

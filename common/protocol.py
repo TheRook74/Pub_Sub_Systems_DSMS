@@ -33,6 +33,21 @@ def encode_data_header(new_offset: int) -> bytes:
     return f"DATA {new_offset}\n".encode()
 
 
+def encode_list_topics(pattern: str) -> str:
+    """
+    Return a LIST_TOPICS request. The pattern may be an exact topic name
+    (e.g. brave.server0), a bare app name (e.g. brave), or a bare server
+    name (e.g. server0). The broker resolves it using the same
+    exact/prefix/suffix rules the subscriber used before.
+    """
+    return f"LIST_TOPICS {pattern}\n"
+
+
+def encode_topics_response(topics: list) -> str:
+    """Return a TOPICS response carrying the broker's matching topic list."""
+    return f"TOPICS {json.dumps(topics)}\n"
+
+
 def encode_vote_request(
     term: int,
     candidate_id: int,
@@ -137,6 +152,15 @@ def decode_message(line: str):
             return "DATA", {"new_offset": int(rest.strip())}
         except ValueError:
             return "DATA", {"new_offset": 0}
+
+    if msg_type == "LIST_TOPICS":
+        return "LIST_TOPICS", {"pattern": rest.strip()}
+
+    if msg_type == "TOPICS":
+        try:
+            return "TOPICS", {"topics": json.loads(rest)}
+        except json.JSONDecodeError:
+            return "TOPICS", {"topics": []}
 
     raft_types = {
         "VOTE_REQUEST", "VOTE_GRANTED", "VOTE_DENIED",

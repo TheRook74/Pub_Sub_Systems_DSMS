@@ -2,9 +2,9 @@
 
 # Broker endpoints used by all components.
 BROKERS = [
-    {"id": 0, "host": "localhost", "port": 5000},
-    {"id": 1, "host": "localhost", "port": 5001},
-    {"id": 2, "host": "localhost", "port": 5002},
+    {"id": 0, "host": "10.145.99.48", "port": 5000},
+    {"id": 1, "host": "10.145.99.43", "port": 5001},
+    {"id": 2, "host": "10.145.27.212", "port": 5002},
 ]
 
 # RAFT timing values in seconds.
