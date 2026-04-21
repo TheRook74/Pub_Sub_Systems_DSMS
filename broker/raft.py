@@ -10,6 +10,7 @@ import time
 # Allow imports from the parent 'dsms' package
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
+from broker.raft_persister import RaftPersister
 from common import config, protocol
 
 
@@ -32,15 +33,29 @@ class RaftNode:
         self.peers = [b["id"] for b in config.BROKERS if b["id"] != node_id]
         self.cluster_size = len(config.BROKERS)
 
-        # Persistent state is kept in memory in this project implementation.
-        self.current_term = 0
-        self.voted_for = None
+        # I reuse log_store's data directory so all on-disk state for this node
+        # lives in one place (broker_data/nodeX/). Loading returns the fields a
+        # crashed node would otherwise forget.
+        self._persister = RaftPersister(log_store.base_dir)
+        (
+            self.current_term,
+            self.voted_for,
+            loaded_last_applied,
+            self.raft_log,
+        ) = self._persister.load()
+        if self.raft_log:
+            print(
+                f"[RAFT {node_id}] Recovered from disk | term={self.current_term} "
+                f"voted_for={self.voted_for} log_len={len(self.raft_log)} "
+                f"last_applied={loaded_last_applied}"
+            )
 
-        # Each entry is a dict with index, term, type, topic, data, and ts.
-        self.raft_log = []
-
-        self.commit_index = -1
-        self.last_applied = -1
+        # Anything we already applied to the topic log files is implicitly
+        # committed, so I lift commit_index up to the persisted last_applied.
+        # Otherwise the leader's catch-up could make _apply_loop rewrite
+        # entries that are already on disk.
+        self.last_applied = loaded_last_applied
+        self.commit_index = loaded_last_applied
 
         # These maps are used only when the node is leader.
         self.next_index = {}
@@ -78,7 +93,7 @@ class RaftNode:
             name="raft-apply",
         ).start()
 
-        print(f"[RAFT {self.node_id}] Started as FOLLOWER | term=0 | peers={self.peers}")
+        print(f"[RAFT {self.node_id}] Started as FOLLOWER | term={self.current_term} | peers={self.peers}")
 
     def is_leader(self) -> bool:
         """Return True if this node is currently the RAFT leader."""
@@ -117,6 +132,10 @@ class RaftNode:
                 "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
             }
             self.raft_log.append(entry)
+            # Flush the new entry to disk before replicating it, so even if the
+            # leader crashes right after returning the index to the caller, the
+            # entry will still be there on restart.
+            self._persister.append_entry(entry)
             print(f"[RAFT {self.node_id}] Proposed [{entry_type}] '{topic}' at index {new_index}")
 
             self._queue_replicate_all()
@@ -157,6 +176,10 @@ class RaftNode:
                     and self._log_is_ok(last_log_index, last_log_term)):
 
                 self.voted_for = candidate_id
+                # Same safety rule as _start_election: record the vote on disk
+                # BEFORE I reply with VOTE_GRANTED, otherwise a crash could
+                # lose the fact that I already voted this term.
+                self._persister.save_meta(self.current_term, self.voted_for, self.last_applied)
                 grant = True
                 self._reset_timer_locked()
                 print(f"[RAFT {self.node_id}] GRANTED vote to Node {candidate_id} (term {term})")
@@ -235,6 +258,10 @@ class RaftNode:
                 self._step_down(term)
             self._reset_timer_locked()
 
+            # I track whether the log was modified in this call so I only pay
+            # the cost of a full rewrite when there is something new to save.
+            log_dirty = False
+
             if prev_log_index >= 0:
                 if prev_log_index >= len(self.raft_log):
                     self._queue_send(
@@ -244,6 +271,10 @@ class RaftNode:
                     return
                 if self.raft_log[prev_log_index]["term"] != prev_log_term:
                     self.raft_log = self.raft_log[:prev_log_index]
+                    # Truncation must be persisted before I ACK, otherwise a
+                    # crash could leave the stale tail on disk and re-surface
+                    # after restart.
+                    self._persister.rewrite_log(self.raft_log)
                     self._queue_send(
                         leader_id,
                         protocol.encode_replicate_ack(self.current_term, self.node_id, len(self.raft_log) - 1, False),
@@ -255,10 +286,12 @@ class RaftNode:
                 if first_new_idx < len(self.raft_log):
                     if self.raft_log[first_new_idx]["term"] != entries[0]["term"]:
                         self.raft_log = self.raft_log[:first_new_idx]
+                        log_dirty = True
             else:
                 cutoff = prev_log_index + 1
                 if len(self.raft_log) > cutoff:
                     self.raft_log = self.raft_log[:cutoff]
+                    log_dirty = True
 
             for entry in entries:
                 idx = entry["index"]
@@ -266,8 +299,16 @@ class RaftNode:
                     if self.raft_log[idx]["term"] != entry["term"]:
                         self.raft_log = self.raft_log[:idx]
                         self.raft_log.append(entry)
+                        log_dirty = True
                 else:
                     self.raft_log.append(entry)
+                    log_dirty = True
+
+            # If I changed the log, flush the whole thing to disk once before
+            # ACKing. Doing one rewrite is simpler than mixing append + rewrite
+            # and the cost is fine for our project-sized logs.
+            if log_dirty:
+                self._persister.rewrite_log(self.raft_log)
 
             if commit_index > self.commit_index:
                 new_commit = min(commit_index, len(self.raft_log) - 1)
@@ -316,6 +357,9 @@ class RaftNode:
         self.state = "FOLLOWER"
         self.current_term = new_term
         self.voted_for = None
+        # I flush the new term and cleared vote to disk before doing anything
+        # else, so a crash after this point cannot un-step-down.
+        self._persister.save_meta(self.current_term, self.voted_for, self.last_applied)
         self._reset_timer_locked()
 
     def _start_election(self):
@@ -327,6 +371,10 @@ class RaftNode:
         self.voted_for = self.node_id
         self.votes_received = {self.node_id}
         self.leader_id = None
+        # Both term and vote changed, so I persist them before sending out the
+        # VOTE_REQUESTs. Raft rule: vote must be durable so I do not vote twice
+        # in the same term if I crash and restart.
+        self._persister.save_meta(self.current_term, self.voted_for, self.last_applied)
         self._reset_timer_locked()
 
         last_log_index = len(self.raft_log) - 1
@@ -372,6 +420,8 @@ class RaftNode:
             "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
         }
         self.raft_log.append(no_op)
+        # Same reasoning as in propose(): persist before replicating.
+        self._persister.append_entry(no_op)
         print(f"[RAFT {self.node_id}] Appended NO_OP at index {no_op['index']} (term={self.current_term})")
         self._queue_replicate_all()
 
@@ -406,10 +456,19 @@ class RaftNode:
         while True:
             time.sleep(0.05)
             with self._lock:
+                applied_any = False
                 while self.last_applied < self.commit_index:
                     self.last_applied += 1
                     entry = self.raft_log[self.last_applied]
                     self._apply_entry(entry)
+                    applied_any = True
+                # Flush last_applied after a batch so a restart does not
+                # re-apply entries that are already on the topic log files.
+                # I save once per batch (not per entry) to cut down on fsyncs.
+                if applied_any:
+                    self._persister.save_meta(
+                        self.current_term, self.voted_for, self.last_applied
+                    )
 
     def _peer_send_worker(self, peer_id: int, q: "queue.Queue"):
         """
