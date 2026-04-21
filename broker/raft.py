@@ -453,22 +453,30 @@ class RaftNode:
         """
         Apply committed entries to LogStore in index order.
         """
+        # I wrap each iteration in try/except so one flaky I/O call (for
+        # example a transient Windows file-lock during save_meta) cannot kill
+        # this thread. If the thread died, last_applied would never advance
+        # again and the node would silently stop applying entries.
         while True:
-            time.sleep(0.05)
-            with self._lock:
-                applied_any = False
-                while self.last_applied < self.commit_index:
-                    self.last_applied += 1
-                    entry = self.raft_log[self.last_applied]
-                    self._apply_entry(entry)
-                    applied_any = True
-                # Flush last_applied after a batch so a restart does not
-                # re-apply entries that are already on the topic log files.
-                # I save once per batch (not per entry) to cut down on fsyncs.
-                if applied_any:
-                    self._persister.save_meta(
-                        self.current_term, self.voted_for, self.last_applied
-                    )
+            try:
+                time.sleep(0.05)
+                with self._lock:
+                    applied_any = False
+                    while self.last_applied < self.commit_index:
+                        self.last_applied += 1
+                        entry = self.raft_log[self.last_applied]
+                        self._apply_entry(entry)
+                        applied_any = True
+                    # Flush last_applied after a batch so a restart does not
+                    # re-apply entries that are already on the topic log
+                    # files. I save once per batch (not per entry) to cut
+                    # down on fsyncs.
+                    if applied_any:
+                        self._persister.save_meta(
+                            self.current_term, self.voted_for, self.last_applied
+                        )
+            except Exception as exc:
+                print(f"[RAFT {self.node_id}] apply-loop error (continuing): {exc}")
 
     def _peer_send_worker(self, peer_id: int, q: "queue.Queue"):
         """

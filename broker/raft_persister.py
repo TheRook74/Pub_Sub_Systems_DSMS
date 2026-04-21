@@ -3,6 +3,7 @@
 import json
 import os
 import threading
+import time
 
 
 class RaftPersister:
@@ -74,7 +75,7 @@ class RaftPersister:
                 )
                 f.flush()
                 os.fsync(f.fileno())
-            os.replace(tmp_path, self._meta_path)
+            _atomic_replace_with_retry(tmp_path, self._meta_path)
 
     def append_entry(self, entry: dict):
         """Append one log entry as a single JSON line and fsync it."""
@@ -97,4 +98,25 @@ class RaftPersister:
                     f.write(json.dumps(entry) + "\n")
                 f.flush()
                 os.fsync(f.fileno())
-            os.replace(tmp_path, self._log_path)
+            _atomic_replace_with_retry(tmp_path, self._log_path)
+
+
+def _atomic_replace_with_retry(src: str, dst: str, attempts: int = 25, delay: float = 0.04):
+    """
+    os.replace is atomic on POSIX but on Windows it can spuriously fail with
+    PermissionError (WinError 5) when the destination file is momentarily held
+    open by another process such as antivirus, Windows Search indexer, or a
+    file preview. We retry with a short backoff so a single transient lock
+    does not kill the apply thread.
+
+    25 attempts x 40 ms = 1 second of total retry budget, which covers almost
+    every real-world AV/indexer lock we've observed on student laptops.
+    """
+    for attempt in range(attempts):
+        try:
+            os.replace(src, dst)
+            return
+        except PermissionError:
+            if attempt == attempts - 1:
+                raise
+            time.sleep(delay)
