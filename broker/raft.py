@@ -16,7 +16,7 @@ from common import config, protocol
 
 class RaftNode:
     """
-    RAFT consensus node. One instance runs per broker process.
+    RAFT consensus node, with one instance per broker process.
     """
 
     def __init__(self, node_id: int, log_store, send_to_peer_fn):
@@ -33,9 +33,8 @@ class RaftNode:
         self.peers = [b["id"] for b in config.BROKERS if b["id"] != node_id]
         self.cluster_size = len(config.BROKERS)
 
-        # I reuse log_store's data directory so all on-disk state for this node
-        # lives in one place (broker_data/nodeX/). Loading returns the fields a
-        # crashed node would otherwise forget.
+        # Reuse log_store's data directory so all persistent node state stays
+        # under broker_data/nodeX and restart recovery can reload it together.
         self._persister = RaftPersister(log_store.base_dir)
         (
             self.current_term,
@@ -50,10 +49,8 @@ class RaftNode:
                 f"last_applied={loaded_last_applied}"
             )
 
-        # Anything we already applied to the topic log files is implicitly
-        # committed, so I lift commit_index up to the persisted last_applied.
-        # Otherwise the leader's catch-up could make _apply_loop rewrite
-        # entries that are already on disk.
+        # Anything already applied to topic logs is effectively committed, so
+        # commit_index starts from persisted last_applied to avoid duplicates.
         self.last_applied = loaded_last_applied
         self.commit_index = loaded_last_applied
 
@@ -176,9 +173,8 @@ class RaftNode:
                     and self._log_is_ok(last_log_index, last_log_term)):
 
                 self.voted_for = candidate_id
-                # Same safety rule as _start_election: record the vote on disk
-                # BEFORE I reply with VOTE_GRANTED, otherwise a crash could
-                # lose the fact that I already voted this term.
+                # Persist the vote before replying, so a crash cannot erase a
+                # vote that was already granted in this term.
                 self._persister.save_meta(self.current_term, self.voted_for, self.last_applied)
                 grant = True
                 self._reset_timer_locked()
@@ -258,8 +254,8 @@ class RaftNode:
                 self._step_down(term)
             self._reset_timer_locked()
 
-            # I track whether the log was modified in this call so I only pay
-            # the cost of a full rewrite when there is something new to save.
+            # Track whether this call changed the log so we only rewrite when
+            # necessary.
             log_dirty = False
 
             if prev_log_index >= 0:
@@ -271,9 +267,8 @@ class RaftNode:
                     return
                 if self.raft_log[prev_log_index]["term"] != prev_log_term:
                     self.raft_log = self.raft_log[:prev_log_index]
-                    # Truncation must be persisted before I ACK, otherwise a
-                    # crash could leave the stale tail on disk and re-surface
-                    # after restart.
+                    # Persist truncation before ACK so stale tail entries do
+                    # not reappear after restart.
                     self._persister.rewrite_log(self.raft_log)
                     self._queue_send(
                         leader_id,
@@ -304,9 +299,7 @@ class RaftNode:
                     self.raft_log.append(entry)
                     log_dirty = True
 
-            # If I changed the log, flush the whole thing to disk once before
-            # ACKing. Doing one rewrite is simpler than mixing append + rewrite
-            # and the cost is fine for our project-sized logs.
+            # If log content changed, rewrite once before ACK.
             if log_dirty:
                 self._persister.rewrite_log(self.raft_log)
 
@@ -357,8 +350,8 @@ class RaftNode:
         self.state = "FOLLOWER"
         self.current_term = new_term
         self.voted_for = None
-        # I flush the new term and cleared vote to disk before doing anything
-        # else, so a crash after this point cannot un-step-down.
+        # Persist term and cleared vote before continuing so step-down cannot
+        # be undone by a crash.
         self._persister.save_meta(self.current_term, self.voted_for, self.last_applied)
         self._reset_timer_locked()
 
@@ -371,9 +364,8 @@ class RaftNode:
         self.voted_for = self.node_id
         self.votes_received = {self.node_id}
         self.leader_id = None
-        # Both term and vote changed, so I persist them before sending out the
-        # VOTE_REQUESTs. Raft rule: vote must be durable so I do not vote twice
-        # in the same term if I crash and restart.
+        # Persist term and vote before sending requests so restart cannot cause
+        # a double vote in the same term.
         self._persister.save_meta(self.current_term, self.voted_for, self.last_applied)
         self._reset_timer_locked()
 
@@ -410,7 +402,8 @@ class RaftNode:
             name="raft-heartbeat",
         ).start()
 
-        # A no-op entry is appended immediately after leadership changes so commit progression stays consistent.
+        # Append a no-op entry immediately after leadership change so commit
+        # progression stays consistent.
         no_op = {
             "index": len(self.raft_log),
             "term": self.current_term,
@@ -453,10 +446,8 @@ class RaftNode:
         """
         Apply committed entries to LogStore in index order.
         """
-        # I wrap each iteration in try/except so one flaky I/O call (for
-        # example a transient Windows file-lock during save_meta) cannot kill
-        # this thread. If the thread died, last_applied would never advance
-        # again and the node would silently stop applying entries.
+        # Keep this loop resilient so one transient I/O failure does not stop
+        # all future apply progress.
         while True:
             try:
                 time.sleep(0.05)
@@ -467,10 +458,8 @@ class RaftNode:
                         entry = self.raft_log[self.last_applied]
                         self._apply_entry(entry)
                         applied_any = True
-                    # Flush last_applied after a batch so a restart does not
-                    # re-apply entries that are already on the topic log
-                    # files. I save once per batch (not per entry) to cut
-                    # down on fsyncs.
+                    # Persist last_applied once per batch so restart does not
+                    # reapply entries that are already on disk.
                     if applied_any:
                         self._persister.save_meta(
                             self.current_term, self.voted_for, self.last_applied
@@ -589,7 +578,8 @@ class RaftNode:
                 print(f"[RAFT {self.node_id}] Applied CREATE_TOPIC -> '{topic}'")
 
         elif entry_type == "METRIC":
-            # Create the topic on demand if local files were removed and the committed log still references it.
+            # Create the topic on demand if local files were removed while the
+            # committed log still references it.
             if not self.log_store.topic_exists(topic):
                 self.log_store.create_topic(topic)
                 print(f"[RAFT {self.node_id}] Auto-created missing topic '{topic}' before applying METRIC")

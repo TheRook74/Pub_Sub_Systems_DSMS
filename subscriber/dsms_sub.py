@@ -1,42 +1,10 @@
-# =============================================================================
-# subscriber/dsms_sub.py  -  DSMS Subscriber Application (DSMS_SUB)
-#
-# Design:
-#   Every POST /subscribe?topic=<pattern> spawns ONE dedicated Subscription:
-#     * its own background thread
-#     * its own output file  (subscriber_output/<pattern>_<ts>_sub<id>.log)
-#     * its own {concrete topic -> byte offset} dict
-#     * its own stop flag, set by DELETE /subscribe
-#
-#   Subscriptions never share state.  Two POSTs for the same pattern
-#   produce two independent threads, two independent files, and two
-#   independent offset maps.
-#
-# PERSISTENCE (survives kill / restart):
-#   A single JSON manifest at subscriber_output/.state_<name>.json records
-#   every live subscription (id, pattern, created_at, file path, per-topic
-#   offsets) and is rewritten atomically after every structural change and
-#   after every successful poll.  On startup the manifest is loaded and
-#   every subscription is re-spawned with the saved offsets; the output
-#   files are reopened in APPEND mode so existing data is preserved.
-#
-#   Identity = --name (defaults to "port<N>").  A lockfile
-#   subscriber_output/.state_<name>.lock holds the current PID so two
-#   processes cannot share the same identity.  Pass a different --name
-#   (or --port) to run more than one subscriber concurrently on the same
-#   machine; each gets its own independent state.
-#
-# HTTP API:
-#   POST   /subscribe?topic=<pattern>      create a subscription
-#   DELETE /subscribe?id=<id>              stop one subscription
-#   DELETE /subscribe?topic=<pattern>      stop every subscription for a pattern
-#   GET    /status                         list all live subscriptions
-#
-# Patterns supported on /subscribe:
-#   brave.server0   (exact concrete topic)
-#   brave           (app prefix   -> every brave.* topic)
-#   server0         (server suffix-> every *.server0 topic)
-# =============================================================================
+"""DSMS subscriber service with one worker thread and one output file per subscription.
+
+Each POST /subscribe call creates an independent Subscription with its own
+offset map and stop flag. State is persisted in a manifest keyed by subscriber
+identity, and a PID lockfile prevents two running processes from sharing the
+same identity at the same time.
+"""
 
 import argparse
 import atexit
@@ -53,7 +21,7 @@ from datetime import datetime
 from flask import Flask, jsonify, request
 
 try:
-    import psutil   # only used for cross-platform lockfile liveness check
+    import psutil  # Used only for cross-platform lockfile liveness checks.
 except ImportError:
     psutil = None
 
@@ -63,9 +31,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from common import config, protocol
 
 
-# =============================================================================
-# Output directory + filename helpers
-# =============================================================================
+# Output directory and filename helpers.
 
 OUTPUT_DIR = os.path.abspath(
     os.path.join(os.path.dirname(__file__), "..", "subscriber_output")
@@ -86,9 +52,7 @@ def _build_output_filename(sub_id: int, pattern: str, created_at: datetime) -> s
     return f"{_sanitize_pattern(pattern)}_{ts}_sub{sub_id}.log"
 
 
-# =============================================================================
-# Lockfile + atomic state writer
-# =============================================================================
+# Lockfile and atomic state writer helpers.
 
 def _pid_alive(pid: int) -> bool:
     """Cross-platform 'is this PID still running?' check."""
@@ -99,8 +63,7 @@ def _pid_alive(pid: int) -> bool:
             return psutil.pid_exists(pid)
         except Exception:
             return False
-    # Fallback — works on POSIX; on Windows raises for invalid signals so
-    # any exception is treated as 'not alive'.
+    # Fallback: works on POSIX. On Windows, invalid-signal cases raise and are treated as not alive.
     try:
         os.kill(pid, 0)
         return True
@@ -110,11 +73,11 @@ def _pid_alive(pid: int) -> bool:
 
 def _acquire_lockfile(lock_path: str) -> bool:
     """
-    Try to claim a PID lockfile.  Returns True on success.
+    Try to claim a PID lockfile and return True on success.
 
     If the file already exists and the PID inside belongs to a live
-    process, we refuse to start so two subscribers can't silently
-    clobber each other's manifest.  A stale lock (dead PID) is
+    process, startup is refused so two subscribers cannot silently
+    clobber each other's manifest. A stale lock (dead PID) is
     reclaimed automatically.
     """
     if os.path.exists(lock_path):
@@ -138,7 +101,7 @@ def _acquire_lockfile(lock_path: str) -> bool:
 
 
 def _release_lockfile(lock_path: str):
-    """Remove the lockfile if it still belongs to us.  Idempotent."""
+    """Remove the lockfile if it still belongs to this process. Idempotent."""
     try:
         if not os.path.exists(lock_path):
             return
@@ -152,9 +115,8 @@ def _release_lockfile(lock_path: str):
 
 def _atomic_write_json(path: str, data: dict, retries: int = 10, delay_sec: float = 0.04):
     """
-    Rewrite `path` atomically: write to a temp file in the same directory,
-    fsync, then os.replace.  A small retry loop tolerates Windows file locks
-    from antivirus / indexer scans, mirroring the raft_persister behavior.
+    Rewrite path atomically: write temp in the same directory, fsync, then replace.
+    A short retry loop tolerates transient Windows file locks.
     """
     directory = os.path.dirname(path) or "."
     os.makedirs(directory, exist_ok=True)
@@ -184,15 +146,13 @@ def _atomic_write_json(path: str, data: dict, retries: int = 10, delay_sec: floa
                 pass
 
 
-# =============================================================================
-# Subscription: one thread, one file, one offsets map
-# =============================================================================
+# Subscription implementation: one thread, one file, one offsets map.
 
 class Subscription:
     """
-    A single /subscribe request incarnated as a background worker.
+    Background worker created from one /subscribe request.
 
-    Each instance is fully self-contained: stopping one does not affect any
+    Each instance is fully self-contained, so stopping one does not affect any
     other subscription, even another one with the exact same pattern.
     """
 
@@ -205,8 +165,7 @@ class Subscription:
         resume_state: dict = None,
     ):
         """
-        A fresh subscription if resume_state is None, otherwise an
-        incarnation of a previously-persisted subscription.
+        Create a fresh subscription when resume_state is None, otherwise resume one.
 
         resume_state shape (as stored in the manifest):
             {
@@ -217,10 +176,10 @@ class Subscription:
         """
         self.id = sub_id
         self.pattern = pattern
-        self._subscriber = subscriber   # back-ref used for network + persistence
+        self._subscriber = subscriber  # Back-reference used for network and persistence.
 
         if resume_state:
-            # Restore creation time so the filename keeps matching.
+            # Restore creation time so filename conventions remain stable.
             try:
                 self.created_at = datetime.strptime(
                     resume_state["created_at"], "%Y-%m-%d %H:%M:%S"
@@ -232,7 +191,7 @@ class Subscription:
                 _build_output_filename(self.id, self.pattern, self.created_at),
             )
             self._offsets = dict(resume_state.get("offsets", {}))
-            file_mode = "ab"   # append to existing file; do NOT truncate
+            file_mode = "ab"  # Append to existing file; do not truncate.
         else:
             self.created_at = datetime.now()
             self.file_path = os.path.join(
@@ -240,7 +199,7 @@ class Subscription:
                 _build_output_filename(self.id, self.pattern, self.created_at),
             )
             self._offsets = {}
-            file_mode = "wb"   # fresh file
+            file_mode = "wb"  # Fresh file.
 
         self._offsets_lock = threading.Lock()
 
@@ -255,16 +214,16 @@ class Subscription:
         )
         self._thread.start()
 
-    # ------------------------------------------------------------------ control
+    # Control methods.
 
     def stop(self):
-        """Signal the thread to exit.  Safe to call more than once."""
+        """Signal the thread to exit; safe to call multiple times."""
         self._stop_event.set()
 
     def alive(self) -> bool:
         return self._thread.is_alive()
 
-    # ----------------------------------------------------------------- status
+    # Status helpers.
 
     def snapshot(self) -> dict:
         """Return a JSON-safe description used by /status."""
@@ -276,7 +235,7 @@ class Subscription:
             "created_at": self.created_at.strftime("%Y-%m-%d %H:%M:%S"),
             "file":       self.file_path,
             "alive":      self.alive(),
-            "topics":     offsets,   # {concrete_topic: last_known_offset}
+            "topics": offsets,  # {concrete_topic: last_known_offset}
         }
 
     def persist_snapshot(self) -> dict:
@@ -294,17 +253,12 @@ class Subscription:
             "offsets":    offsets,
         }
 
-    # --------------------------------------------------------------- main loop
+    # Main polling loop.
 
     def _run(self):
         """
-        Loop body:
-          1. Expand the pattern via LIST_TOPICS (every cycle -> picks up new
-             concrete topics that were created after we subscribed).
-          2. Register every newly-discovered topic at offset 0.
-          3. Poll each known topic at its current offset, append new rows to
-             the file, update the offset.
-          4. Sleep POLL_INTERVAL (abortable via _stop_event).
+          Poll cycle: discover topics, register new ones at offset zero, fetch new
+          data per topic, append to file, then sleep until the next interval.
         """
         print(f"[SUB#{self.id}] Started | pattern='{self.pattern}' "
               f"| file='{self.file_path}'")
@@ -312,19 +266,17 @@ class Subscription:
         while not self._stop_event.is_set():
             try:
                 self._poll_once()
-                # Persist offsets after every successful cycle so a crash
-                # loses at most one poll-interval worth of progress.
+                # Persist offsets after each successful cycle.
                 self._subscriber.request_state_save()
             except Exception as e:
-                # Don't let a transient network / parse error kill the thread.
+                # Keep running after transient network or parsing failures.
                 print(f"[SUB#{self.id}] Poll error (continuing): {e}")
 
-            # _stop_event.wait returns True if we were told to stop.
+            # _stop_event.wait returns True when stop is requested.
             if self._stop_event.wait(timeout=config.POLL_INTERVAL):
                 break
 
-        # Clean shutdown: flush + close the file so partial buffers don't
-        # get lost on exit.
+        # Flush and close file on shutdown.
         try:
             with self._file_lock:
                 self._fh.flush()
@@ -335,19 +287,19 @@ class Subscription:
 
     def _poll_once(self):
         """One iteration of the loop: discover + poll + write."""
-        # 1. Discover concrete topics that currently match the pattern.
+        # Discover concrete topics that currently match the pattern.
         concrete = self._subscriber.list_topics_from_broker(self.pattern)
 
         with self._offsets_lock:
-            # 2. Bring any new topics into our tracking map at offset 0.
+            # Add newly discovered topics at offset zero.
             for t in concrete:
                 if t not in self._offsets:
                     self._offsets[t] = 0
                     print(f"[SUB#{self.id}] Tracking new topic '{t}' from offset 0")
-            # Snapshot what to poll this cycle.
+            # Snapshot topics for this cycle.
             topics_to_poll = list(self._offsets.items())
 
-        # 3. Pull new bytes for each topic and append to our file.
+        # Pull bytes for each tracked topic.
         for topic, offset in topics_to_poll:
             if self._stop_event.is_set():
                 return
@@ -361,7 +313,7 @@ class Subscription:
         """
         result = self._subscriber.fetch_topic_bytes(topic, start_offset)
         if result is None:
-            return  # broker unreachable this cycle; will retry
+            return  # Broker unreachable in this cycle; retry later.
         new_offset, raw_content = result
 
         if raw_content:
@@ -372,9 +324,7 @@ class Subscription:
 
     def _write_raw_to_file(self, topic: str, raw_bytes: bytes):
         """
-        Tag each JSON line with its source topic (needed so aggregated
-        files like server0_*.log remain unambiguous) and append the
-        block as one write.
+        Tag each JSON line with its source topic and append the block in one write.
         """
         tagged_lines = []
         for line in raw_bytes.decode("utf-8", errors="replace").splitlines():
@@ -402,16 +352,14 @@ class Subscription:
                 print(f"[SUB#{self.id}] Write error: {e}")
 
 
-# =============================================================================
-# Subscriber: HTTP layer + shared leader discovery + subscription registry
-# =============================================================================
+# Subscriber: HTTP layer, leader discovery, and subscription registry.
 
 class Subscriber:
     """
     HTTP frontend that owns all Subscription instances.
 
     Persistent identity comes from `name` (e.g. "port8080" or a user-supplied
-    string).  Two processes with the same name cannot run concurrently —
+    string). Two processes with the same name cannot run concurrently;
     the lockfile enforces this.
     """
 
@@ -431,23 +379,20 @@ class Subscriber:
         self._state_path = os.path.join(OUTPUT_DIR, f".state_{safe_name}.json")
         self._lock_path = os.path.join(OUTPUT_DIR, f".state_{safe_name}.lock")
 
-        self._subs: dict = {}                 # sub_id -> Subscription
+        self._subs: dict = {}  # sub_id -> Subscription
         self._subs_lock = threading.Lock()
         self._next_sub_id = 1
 
         self._leader_port = None
         self._leader_lock = threading.Lock()
 
-        # Serializes writes to the state manifest so a burst of poll
-        # callbacks can't interleave on disk.
+        # Serialize manifest writes so concurrent poll callbacks do not interleave on disk.
         self._state_save_lock = threading.Lock()
 
         # Lockfile: refuse to start a second process with the same name.
         if not _acquire_lockfile(self._lock_path):
             raise SystemExit(1)
-        # Release the lock on normal interpreter exit.  Kill -9 still
-        # leaves a stale lock, but _acquire_lockfile reclaims it next run
-        # once the PID is dead.
+        # Release lock on normal interpreter exit; stale locks are reclaimed on next run.
         atexit.register(_release_lockfile, self._lock_path)
         atexit.register(self._save_state_now)
 
@@ -457,7 +402,7 @@ class Subscriber:
         # Rehydrate previously-saved subscriptions and start their threads.
         self._restore_from_manifest()
 
-    # ------------------------------------------------------------------ routes
+    # HTTP routes.
 
     def _register_routes(self):
         app = self.app
@@ -479,7 +424,7 @@ class Subscriber:
                 "created_at":      sub.created_at.strftime("%Y-%m-%d %H:%M:%S"),
             }), 200
 
-        # DELETE /subscribe?id=<id>  OR  DELETE /subscribe?topic=<pattern>
+        # DELETE /subscribe?id=<id> or DELETE /subscribe?topic=<pattern>
         @app.route("/subscribe", methods=["DELETE"])
         def unsubscribe():
             raw_id = request.args.get("id", "").strip()
@@ -532,7 +477,7 @@ class Subscriber:
                 "subscriptions": subs,
             }), 200
 
-    # ------------------------------------------------------- subscription mgmt
+    # Subscription management.
 
     def _spawn_subscription(self, pattern: str) -> Subscription:
         """Allocate an id and launch a new Subscription thread."""
@@ -550,18 +495,17 @@ class Subscriber:
               f"file='{sub.file_path}'")
         return sub
 
-    # ------------------------------------------------ persistence: save + load
+    # Persistence operations.
 
     def request_state_save(self):
         """
-        Called by each Subscription after a successful poll to keep the
-        manifest in sync with current offsets.  Serialized by
-        _state_save_lock so concurrent pollers don't stomp on each other.
+        Called by each Subscription after successful polling to keep the
+        manifest aligned with current offsets.
         """
         self._save_state_now()
 
     def _save_state_now(self):
-        """Rewrite the on-disk manifest atomically.  Best effort."""
+        """Rewrite the on-disk manifest atomically; best effort."""
         try:
             with self._state_save_lock:
                 with self._subs_lock:
@@ -576,13 +520,13 @@ class Subscriber:
                 }
                 _atomic_write_json(self._state_path, payload)
         except Exception as e:
-            # Persistence failure should never kill a poller thread.
+            # Persistence failures must not terminate poller threads.
             print(f"[SUB] State save failed ({self._state_path}): {e}")
 
     def _restore_from_manifest(self):
         """
         Load the manifest (if any) and re-spawn every saved subscription.
-        Output files are reopened in append mode; offsets are restored so
+        Output files are reopened in append mode and offsets are restored so
         the poll picks up exactly where the previous process stopped.
         """
         if not os.path.exists(self._state_path):
@@ -601,8 +545,7 @@ class Subscriber:
             print(f"[SUB] State file empty (no subscriptions to resume)")
             return
 
-        # Preserve the id space so resumed subscriptions keep their ids and
-        # any new POSTs continue counting upward.
+        # Preserve id space so resumed subscriptions keep their ids.
         max_saved_id = max((s.get("id", 0) for s in saved_subs), default=0)
         self._next_sub_id = max(data.get("next_sub_id", max_saved_id + 1),
                                 max_saved_id + 1)
@@ -619,7 +562,7 @@ class Subscriber:
             try:
                 sub = Subscription(sub_id, pattern, self, resume_state=s)
             except OSError as e:
-                # File could have been deleted between runs — fall back to fresh.
+                # File may have been deleted between runs; fall back to fresh start.
                 print(f"[SUB] Could not reopen file for sub#{sub_id} "
                       f"('{s.get('file')}'): {e}.  Re-creating from scratch.")
                 sub = Subscription(sub_id, pattern, self)
@@ -628,16 +571,12 @@ class Subscriber:
             print(f"[SUB] Resumed sub#{sub.id} pattern='{pattern}' "
                   f"offsets={s.get('offsets', {})}")
 
-    # ======================================================================
-    # Broker network helpers (shared across all Subscription instances)
-    # ======================================================================
+    # Broker network helpers shared across all Subscription instances.
 
     def list_topics_from_broker(self, pattern: str) -> list:
         """
-        Ask the RAFT leader for every concrete topic matching a pattern.
-        Returns an empty list if every broker is unreachable or nothing
-        matches.  Updates _leader_port as a side effect so subsequent
-        calls go directly to the leader.
+        Ask the RAFT leader for concrete topics matching a pattern.
+        Return an empty list if no broker is reachable or nothing matches.
         """
         message = protocol.encode_list_topics(pattern)
         for host, port in self._broker_candidates():
@@ -654,7 +593,7 @@ class Subscriber:
                     if leader_port > 0:
                         with self._leader_lock:
                             self._leader_port = leader_port
-                    continue  # retry at the hinted leader
+                    continue  # Retry at hinted leader.
 
                 if msg_type == "TOPICS":
                     with self._leader_lock:
@@ -673,7 +612,7 @@ class Subscriber:
     def fetch_topic_bytes(self, topic: str, byte_offset: int):
         """
         Send SUBSCRIBE <topic> <byte_offset> and return (new_offset, raw_bytes).
-        Returns None if no broker could serve the request this cycle.
+        Return None when no broker can serve this cycle.
         """
         message = protocol.encode_subscribe(topic, byte_offset)
         for host, port in self._broker_candidates():
@@ -691,7 +630,7 @@ class Subscriber:
                         if leader_port > 0:
                             with self._leader_lock:
                                 self._leader_port = leader_port
-                        continue  # retry at hinted leader
+                        continue  # Retry at hinted leader.
 
                     if msg_type != "DATA":
                         print(f"[SUB] Unexpected response type: {msg_type}")
@@ -735,7 +674,7 @@ class Subscriber:
                 return b["host"]
         return config.BROKERS[0]["host"]
 
-    # --------------------------------------------------------------------- run
+    # Runtime entrypoint.
 
     def run(self):
         """Start the Flask HTTP server (blocking)."""
@@ -753,9 +692,7 @@ class Subscriber:
                      debug=False, use_reloader=False)
 
 
-# =============================================================================
-# Entry Point
-# =============================================================================
+# Entry point.
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="DSMS Subscriber - per-subscribe thread + file, persistent across restarts.")

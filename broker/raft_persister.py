@@ -8,9 +8,9 @@ import time
 
 class RaftPersister:
     """
-    Save and load current_term, voted_for, and raft_log to disk so a node can
-    restart without forgetting them. These are the fields Raft's paper marks as
-    "Persistent state on all servers" in Figure 2.
+    Save and load current_term, voted_for, and raft_log so a node can restart
+    without losing RAFT state. These fields are the persistent state listed in
+    Figure 2 of the RAFT paper.
 
     Two files are kept:
       - raft_meta.json   : {"current_term": N, "voted_for": X}
@@ -27,14 +27,12 @@ class RaftPersister:
 
     def load(self):
         """
-        Load the four fields from disk. If this is a fresh node (no files yet),
-        return the same defaults RaftNode uses on a clean start.
+        Load persistent fields from disk. If this is a fresh node, return the
+        same defaults used by RaftNode on clean startup.
 
-        I also persist last_applied even though Raft calls it "volatile". Our
-        LogStore appends blindly, so if we restart and re-apply committed
-        entries that are already on disk, we would get duplicate lines in the
-        topic log files. Remembering last_applied lets me skip entries that
-        were already written before the crash.
+        last_applied is persisted even though RAFT classifies it as volatile.
+        In this project, LogStore appends blindly, so replaying already-applied
+        entries after restart would duplicate topic-log lines.
         """
         current_term = 0
         voted_for = None
@@ -59,8 +57,7 @@ class RaftPersister:
 
     def save_meta(self, current_term: int, voted_for, last_applied: int = -1):
         """
-        Rewrite the meta file atomically. Write to a temp file first, fsync, then
-        rename so a crash mid-write cannot leave a half-written file behind.
+        Rewrite meta atomically: write temp, fsync, then replace.
         """
         with self._lock:
             tmp_path = self._meta_path + ".tmp"
@@ -87,9 +84,8 @@ class RaftPersister:
 
     def rewrite_log(self, raft_log: list):
         """
-        Rewrite the full log file. Needed when RAFT truncates the tail of the log
-        because a follower found a conflicting entry, since we cannot "un-append"
-        from an append-only file otherwise.
+        Rewrite the full log when RAFT truncates conflicting tail entries,
+        because append-only files cannot remove bytes from the end.
         """
         with self._lock:
             tmp_path = self._log_path + ".tmp"
@@ -103,14 +99,11 @@ class RaftPersister:
 
 def _atomic_replace_with_retry(src: str, dst: str, attempts: int = 25, delay: float = 0.04):
     """
-    os.replace is atomic on POSIX but on Windows it can spuriously fail with
-    PermissionError (WinError 5) when the destination file is momentarily held
-    open by another process such as antivirus, Windows Search indexer, or a
-    file preview. We retry with a short backoff so a single transient lock
-    does not kill the apply thread.
+    os.replace is atomic on POSIX, but on Windows it can fail with
+    PermissionError (WinError 5) when another process briefly holds dst.
+    Retry with short backoff so transient locks do not fail the caller.
 
-    25 attempts x 40 ms = 1 second of total retry budget, which covers almost
-    every real-world AV/indexer lock we've observed on student laptops.
+    25 attempts x 40 ms gives about 1 second total retry budget.
     """
     for attempt in range(attempts):
         try:
