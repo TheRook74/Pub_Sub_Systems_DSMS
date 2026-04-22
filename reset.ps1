@@ -12,9 +12,12 @@
 #   .\reset.ps1
 #
 # What it cleans:
-#   1. Any lingering python broker processes on this machine.
+#   1. Any lingering python broker / publisher / subscriber processes.
 #   2. The entire broker_data\ directory (RAFT meta, RAFT log, topic files).
-#   3. Python __pycache__ folders so no stale .pyc files are loaded.
+#   3. The entire subscriber_output\ directory (per-pattern .log files,
+#      .state_<name>.json manifests, and .state_<name>.lock lockfiles —
+#      aka everything that makes a subscriber 'remember' its previous run).
+#   4. Python __pycache__ folders so no stale .pyc files are loaded.
 # =============================================================================
 
 $ErrorActionPreference = "Stop"
@@ -28,7 +31,7 @@ Write-Host ""
 # -----------------------------------------------------------------------------
 # Step 1: kill leftover broker / publisher / subscriber processes
 # -----------------------------------------------------------------------------
-Write-Host "[1/3] Killing any leftover python broker/publisher/subscriber processes..."
+Write-Host "[1/4] Killing any leftover python broker/publisher/subscriber processes..."
 $killed = 0
 Get-CimInstance Win32_Process -Filter "Name = 'python.exe'" |
     Where-Object {
@@ -53,7 +56,7 @@ if ($killed -eq 0) {
 # Step 2: wipe broker_data directory (RAFT state + topic log files)
 # -----------------------------------------------------------------------------
 Write-Host ""
-Write-Host "[2/3] Removing broker_data\ ..."
+Write-Host "[2/4] Removing broker_data\ ..."
 if (Test-Path ".\broker_data") {
     Remove-Item -Recurse -Force ".\broker_data"
     Write-Host "    broker_data\ deleted" -ForegroundColor Green
@@ -62,10 +65,25 @@ if (Test-Path ".\broker_data") {
 }
 
 # -----------------------------------------------------------------------------
-# Step 3: clear python bytecode caches so no stale code sneaks in
+# Step 3: wipe subscriber_output directory
+#   - *.log            per-pattern output files written by each subscription
+#   - .state_*.json    the persistence manifest(s) (one per --name)
+#   - .state_*.lock    PID lockfile(s); stale locks would block restart
 # -----------------------------------------------------------------------------
 Write-Host ""
-Write-Host "[3/3] Removing __pycache__ folders..."
+Write-Host "[3/4] Removing subscriber_output\ ..."
+if (Test-Path ".\subscriber_output") {
+    Remove-Item -Recurse -Force ".\subscriber_output"
+    Write-Host "    subscriber_output\ deleted" -ForegroundColor Green
+} else {
+    Write-Host "    subscriber_output\ did not exist" -ForegroundColor DarkGray
+}
+
+# -----------------------------------------------------------------------------
+# Step 4: clear python bytecode caches so no stale code sneaks in
+# -----------------------------------------------------------------------------
+Write-Host ""
+Write-Host "[4/4] Removing __pycache__ folders..."
 $caches = Get-ChildItem -Path . -Recurse -Directory -Filter "__pycache__" -ErrorAction SilentlyContinue
 if ($caches) {
     foreach ($c in $caches) {

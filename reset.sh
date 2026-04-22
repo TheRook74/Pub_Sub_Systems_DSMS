@@ -14,7 +14,10 @@
 # What it cleans:
 #   1. Any lingering python broker / publisher / subscriber processes.
 #   2. The entire broker_data/ directory (RAFT meta, RAFT log, topic files).
-#   3. Python __pycache__ folders so no stale .pyc files are loaded.
+#   3. The entire subscriber_output/ directory (per-pattern .log files,
+#      .state_<name>.json manifests, and .state_<name>.lock lockfiles —
+#      aka everything that makes a subscriber "remember" its previous run).
+#   4. Python __pycache__ folders so no stale .pyc files are loaded.
 # =============================================================================
 
 set -u
@@ -41,7 +44,7 @@ echo
 # -----------------------------------------------------------------------------
 # Step 1: kill leftover broker / publisher / subscriber processes
 # -----------------------------------------------------------------------------
-echo "[1/3] Killing any leftover python broker/publisher/subscriber processes..."
+echo "[1/4] Killing any leftover python broker/publisher/subscriber processes..."
 
 # Match any python process whose command line references one of our scripts.
 # -f matches the full argument list, not just the executable name.
@@ -75,7 +78,7 @@ fi
 # Step 2: wipe broker_data directory (RAFT state + topic log files)
 # -----------------------------------------------------------------------------
 echo
-echo "[2/3] Removing broker_data/ ..."
+echo "[2/4] Removing broker_data/ ..."
 if [ -d "./broker_data" ]; then
     rm -rf ./broker_data
     echo -e "    ${GREEN}broker_data/ deleted${RESET}"
@@ -84,10 +87,25 @@ else
 fi
 
 # -----------------------------------------------------------------------------
-# Step 3: clear python bytecode caches so no stale code sneaks in
+# Step 3: wipe subscriber_output directory
+#   - *.log            per-pattern output files written by each subscription
+#   - .state_*.json    the persistence manifest(s) (one per --name)
+#   - .state_*.lock    PID lockfile(s); stale locks would block restart
 # -----------------------------------------------------------------------------
 echo
-echo "[3/3] Removing __pycache__ folders..."
+echo "[3/4] Removing subscriber_output/ ..."
+if [ -d "./subscriber_output" ]; then
+    rm -rf ./subscriber_output
+    echo -e "    ${GREEN}subscriber_output/ deleted${RESET}"
+else
+    echo -e "    ${DIM}subscriber_output/ did not exist${RESET}"
+fi
+
+# -----------------------------------------------------------------------------
+# Step 4: clear python bytecode caches so no stale code sneaks in
+# -----------------------------------------------------------------------------
+echo
+echo "[4/4] Removing __pycache__ folders..."
 count="$(find . -type d -name "__pycache__" 2>/dev/null | wc -l | tr -d ' ')"
 if [ "$count" -gt 0 ]; then
     find . -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null
